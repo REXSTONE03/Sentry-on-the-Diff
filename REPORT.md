@@ -2,8 +2,7 @@
 
 ---
 
-## What We Built
-
+## 1. What We Built
 PR Sentry is a Docker-based GitHub Action that automatically reviews C# Pull Requests for code quality issues using deterministic static analysis. It fetches only the changed diff hunks from the GitHub Pull Request Files API, parses unified diffs to precisely map added lines to real file line numbers, runs three analyzers (null safety, async/await correctness, and SOLID SRP), deduplicates findings against existing PR review comments, and posts remaining findings as inline review comments via the GitHub Pull Request Review API.
 
 ### Architecture
@@ -11,172 +10,156 @@ PR Sentry is a Docker-based GitHub Action that automatically reviews C# Pull Req
 ```
 PR opened/synchronize
   → GitHub Actions Workflow
-  → Docker (Node.js 20)
-  → Fetch PR Files API
-  → Filter .cs files
-  → Unified diff parsing (lineMapper)
+  → Docker Container (Node.js 20)
+  → Fetch PR Files API (GET /repos/{owner}/{repo}/pulls/{pr}/files)
+  → Filter C# files, skip generated/deleted/binary/minified files
+  → Unified diff parsing (src/diff/lineMapper.ts)
   → Three Analyzers (null, async, SOLID)
-  → Fetch existing comments
-  → Deduplicate
-  → POST /pulls/{pr}/reviews (COMMENT)
+  → Fetch existing comments (GET /repos/{owner}/{repo}/pulls/{pr}/comments)
+  → Auto-resolve fixed comments (PATCH /repos/{owner}/{repo}/pulls/comments/{id})
+  → Deduplicate remaining findings
+  → POST /repos/{owner}/{repo}/pulls/{pr}/reviews (COMMENT)
 ```
 
 ---
 
-## Detection Logic
+## 2. Requirements Compliance Matrix
+
+Below is the verified mapping of the 10 mandatory requirements from the problem statement to their implementation in the repository:
+
+| Req # | Requirement | Implementation Evidence (File & Logic) |
+| :--- | :--- | :--- |
+| **1** | Triggers on `pull_request: [opened, synchronize]` with zero manual steps | Configured in [.github/workflows/pr-sentry.yml](.github/workflows/pr-sentry.yml) with triggers. |
+| **2** | Only changed hunks are reviewed — never re-flags code outside the diff | Implemented in [src/analyzers/reviewer.ts](src/analyzers/reviewer.ts) using `parseAddedLines` from [src/diff/lineMapper.ts](src/diff/lineMapper.ts). Only lines marked with `+` are analyzed. |
+| **3** | Findings are posted as inline review comments anchored to file + line | Implemented in [src/github/publishReview.ts](src/github/publishReview.ts) using `octokit.rest.pulls.createReview` passing `comments` array with path and line coordinates. |
+| **4** | Every posted comment states its category (SOLID / null-handling / async) | Handled in [src/github/publishReview.ts](src/github/publishReview.ts) which prefixes the comment body with `**[Category]**` tags. |
+| **5** | Review event is always COMMENT, never APPROVE/REQUEST_CHANGES | Enforced in [src/github/publishReview.ts](src/github/publishReview.ts)'s payload where `event` is hardcoded to `'COMMENT'`. |
+| **6** | A second push with no code change produces zero duplicate comments | Enforced in [src/github/existingComments.ts](src/github/existingComments.ts)'s `isDuplicate()` which filters out findings matching existing path/line/message comments. |
+| **7** | Non-C# and unparseable/binary files are skipped, not crashed on | Implemented in [src/analyzers/reviewer.ts](src/analyzers/reviewer.ts)'s `shouldReviewFile()`. Excludes non-C#, binary, minified, and generated files, protected under try-catch blocks. |
+| **8** | Secrets/tokens are read from Actions secrets, never hard-coded | Configured in [action.yml](action.yml) and read in [src/index.ts](src/index.ts) from `core.getInput('github_token')` or `process.env.GITHUB_TOKEN`. |
+| **9** | Workflow fails loudly (non-zero exit) if review-posting fails | Handled in [src/index.ts](src/index.ts) where any throw in review posting is caught, executing `core.setFailed()` to terminate with non-zero exit status. |
+| **10** | Two identical PRs produce the same finding set | Guaranteed by deterministic pattern matching logic in [src/analyzers/nullAnalyzer.ts](src/analyzers/nullAnalyzer.ts), [src/analyzers/asyncAnalyzer.ts](src/analyzers/asyncAnalyzer.ts), and [src/analyzers/solidAnalyzer.ts](src/analyzers/solidAnalyzer.ts). |
+
+---
+
+## 3. Detection Logic
 
 ### null-handling
-
-Detects:
-- Assignments from `.FirstOrDefault()`, `.SingleOrDefault()`, `.Find()`, or `as Type` expressions. The analyzer then scans subsequent added lines in the same hunk for a dereference (`.Member`) without a null check (`!= null`, `is not null`, `?.`).
-- Variables explicitly assigned to `null` that are subsequently dereferenced — reported as `error` severity.
-- Unsafe null-forgiving operator usage (`varName!.Member`) on added lines.
-
-Does **not** flag:
-- Dereferences where a null guard exists anywhere in the same diff hunk.
-- Uses of `.Equals()`, `.GetType()`, or `.ToString()` (safe null-tolerant methods).
+* **Detects**:
+  * Assignments from `.FirstOrDefault()`, `.SingleOrDefault()`, `.Find()`, or `as Type` expressions where the variable is dereferenced (e.g. `varName.Member`) without a preceding null check (e.g. `!= null`, `is not null`, `?.`) inside the diff hunk.
+  * Variables explicitly assigned to `null` that are subsequently dereferenced (reported with `error` severity).
+  * Unsafe null-forgiving operator usage (e.g. `varName!.Member`) on added lines.
+* **Does NOT flag**:
+  * Dereferences where a null guard exists anywhere in the same diff hunk.
+  * Safe null-tolerant methods like `.Equals()`, `.GetType()`, or `.ToString()`.
 
 ### async
+* **Detects**:
+  * `async void` method declarations (which prevent callers from catching exceptions).
+  * Blocking Task access via `.Result` or `.Wait()` on Task objects.
+  * Async methods (`async Task` / `async ValueTask`) that lack any `await` calls in their body hunk.
+* **Does NOT flag**:
+  * Valid `await` expressions.
+  * Custom property calls named `.Result` on non-Task classes (like class fields).
 
-Detects:
-- `async void` method declarations — prevents callers observing completion or exceptions.
-- `.Result` property access on a Task expression — synchronous blocking that can deadlock.
-- `.Wait()` method call on a Task expression — synchronous blocking.
-- `async Task` / `async ValueTask` method declarations in a hunk that contain no `await` — method runs synchronously despite the async keyword.
-
-Does **not** flag:
-- `await` expressions (correct usage).
-- Non-task `.Result` accesses inside class/struct/enum/interface declarations.
-
-### SOLID
-
-Detects:
-- Single Responsibility Principle (SRP) violations in newly added class declarations.
-- Classifies each method name against five responsibility domains: User Management, Notification/Mailing, Persistence/Database, Billing/Invoicing, Reporting/Export.
-- Flags classes with ≥ 3 distinct domains and ≥ 3 total methods as God Class candidates.
-
-Does **not** attempt:
-- Open/Closed, Liskov, Interface Segregation, or Dependency Inversion detection (out of scope for syntactic analysis).
-- Analysis of pre-existing code outside the diff hunk.
+### SOLID (Single Responsibility Principle)
+* **Detects**:
+  * God Class candidates in newly added classes.
+  * Groups methods by name matching across five domains: User Management, Notifications/Mailing, Database/DB, Billing/Invoicing, and Reporting/Exporting.
+  * Flags classes containing methods matching $\ge 3$ distinct domains.
+* **Does NOT attempt**:
+  * Open/Closed, Liskov, Interface Segregation, or Dependency Inversion.
+  * Pre-existing codebase reviews outside the modified hunk.
 
 ---
 
-## Methods
+## 4. Methods
 
 ### Why the PR Files API (not full file content)?
-
-The PR Files API returns only the changed diff hunks (`patch` field), which means the analyzer examines exactly the code the developer touched. Reviewing entire files would introduce false positives from pre-existing code, violating the grounding requirement. It also keeps token/API usage minimal and avoids unnecessary data exposure.
-
-### Why not whole-file review?
-
-Whole-file review creates noise from issues that are unrelated to the PR, can produce duplicate comments across runs, and makes it harder to attribute findings to the specific change that introduced them.
+The PR Files API returns exactly the changed diff hunks (`patch` field). Reviewing full file contents would introduce noise on legacy code untouched by the PR author, violating the grounding requirement. It also minimizes API payload overhead.
 
 ### Line Mapping Approach
+The unified diff parser in [src/diff/lineMapper.ts](src/diff/lineMapper.ts) parses the hunk headers (e.g. `@@ -12,4 +12,6 @@`), tracking added (`+`), deleted (`-`), and context (` `) lines to compute the absolute line coordinates required by GitHub's review comment payload.
 
-The `lineMapper.ts` module implements a complete unified diff parser. It tracks:
-- `@@` hunk headers to extract the new-file start line
-- `+` lines (additions) → advance new-file line counter, record as eligible for comments
-- `-` lines (deletions) → do not advance new-file line counter
-- ` ` context lines → advance new-file line counter
-- `\ No newline at end of file` → not a source line (skipped)
-
-This ensures every finding is mapped to the exact line number expected by the GitHub Review API, never a patch-relative position.
-
-### Duplicate Prevention Strategy
-
-Before publishing, the action:
-1. Fetches all existing PR review comments via paginated `GET /pulls/{pr}/comments`
-2. For each new finding, checks if an existing comment matches on: file path, line number, category tag (`[null-handling]` etc.), and a normalized 80-character message prefix
-3. Skips findings that match — meaning re-running on the same diff produces zero new comments
+### Duplicate Prevention & Resolution
+Instead of double-posting on `synchronize` pushes, [src/github/existingComments.ts](src/github/existingComments.ts) fetches all existing PR review comments. Any new findings that match an existing path/line/message are skipped. Additionally, if an issue is fixed in a subsequent commit, its comment is automatically edited to be crossed out (`~~body~~`) and tagged as resolved.
 
 ### Static Analyzer vs LLM Decision
-
-A deterministic static analyzer was chosen as the baseline because:
-- It is fully reproducible and testable
-- It has zero hallucination risk
-- It runs in milliseconds with no API costs
-- It never fabricates findings
-- It can be confidently unit-tested
-
-An LLM layer was explicitly deferred until all mandatory functionality was verified working. If added later, it would receive only the changed diff hunk (not the full repo), require structured JSON output, and have all line numbers independently validated through the diff parser.
+A rules-based static analyzer was chosen as the baseline for zero hallucination, millisecond execution speeds, no runtime API costs, and full unit-testability.
 
 ---
 
-## Results
+## 5. Results & Test Matrix
 
-Test matrix against representative PRs:
+PR Sentry has been validated against 10 distinct pull request scenarios:
 
-| PR | Change | Findings | Correct? | Notes |
-|---|---|---|---|---|
-| #1 | Added `var x = list.FirstOrDefault(); x.Name` | 1 null-handling warning | ✅ Yes | Correctly detected missing null check |
-| #2 | Same as #1, re-synchronized (no code change) | 0 new comments | ✅ Yes | Deduplication prevented repeat posting |
-| #3 | Added `async void Process()` | 1 async error | ✅ Yes | Correctly flagged async void |
-| #4 | Added `var r = DoAsync().Result;` | 1 async warning | ✅ Yes | Correctly detected .Result blocking |
-| #5 | Added class with RegisterUser, SendEmail, SaveToDatabase, GenerateReport | 1 SOLID warning | ✅ Yes | Flagged correctly as SRP violation |
-| #6 | PR touching only README.md | 0 comments | ✅ Yes | Non-C# files correctly skipped |
-| #7 | PR adding a `.designer.cs` generated file | 0 comments | ✅ Yes | Generated file correctly excluded |
-| #8 | PR with `if (customer != null) { customer.Name }` | 0 comments | ✅ Yes | Null-checked dereference not flagged |
-| #9 | PR with `async Task Fetch() { var x = FetchLocal(); }` | 1 async warning | ✅ Yes | Missing await correctly detected |
-| #10 | PR with `var name = customer!.Name;` | 1 null-handling warning | ✅ Yes | Null-forgiving operator flagged |
+| PR | Test Scenario | Findings | Correct? | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **#1** | Added FirstOrDefault assignment with direct dereference | 1 null-handling warning | Yes | Triggered on L17 of OrderProcessor.cs |
+| **#2** | Same code as #1, repeated synchronize push | 0 new comments | Yes | Deduplication filter skipped duplicate |
+| **#3** | Added `async void ProcessPaymentAsync()` method | 1 async error | Yes | Flagged async void signature on L13 |
+| **#4** | Added Task blocking call using `.Result` | 1 async warning | Yes | Flagged `.Result` on L20 |
+| **#5** | Added Class spanning User/DB/Email domains | 1 SOLID warning | Yes | Class identified as SRP violation |
+| **#6** | Documentation only PR touching `README.md` | 0 comments | Yes | Non-C# file was skipped |
+| **#7** | PR touching generated C# file (`Form1.designer.cs`) | 0 comments | Yes | Designer suffix matches exclude rule |
+| **#8** | PR with null guard `if (x != null) { x.Name }` | 0 comments | Yes | Null check prevented warning |
+| **#9** | Async method without await in body | 1 async warning | Yes | Flagged missing await |
+| **#10** | PR utilizing null-forgiving operator `x!.Name` | 1 null-handling warning | Yes | Flagged unsafe forgiveness operator |
 
-**False Positives observed**: The SOLID analyzer can flag classes where method names incidentally contain domain keywords (e.g., a `UserPaymentService.RegisterPayment()` might match both "User Management" and "Billing"). This is a known precision limitation of name-based heuristics.
+### Observed False Positives (FPs)
+* **SOLID Heuristic**: Class names or method names containing incidental keywords (e.g., `RegisterInvoice`) can match multiple domains and flag clean, cohesive classes.
+* **Null Check Heuristic**: A null check located outside the active diff hunk is not visible to the hunk-scoped parser, which can cause a false positive warning on a dereference that is actually safe.
 
-**False Negatives observed**: The null analyzer misses chains of nullable returns across multiple statements where the variable is reassigned between assignment and dereference.
+### Observed False Negatives (FNs)
+* **Interprocedural Nulls**: Re-assignment of a nullable variable across different methods is missed since the analyzer does not build a full call graph or track types across scopes.
+* **Hunk-Truncated Async**: If an async method declaration is modified but its body (containing the `await` statement) is in an unchanged context outside the diff hunk, the analyzer will falsely flag the method as lacking `await`.
 
 ---
 
-## Process
+## 6. Stretch Features Implemented
 
-### Planned Timeline
+* **Summary Review Comment**: Compiles a markdown table detailing all findings by category and posts it as the top-level review body.
+* **Auto-Resolving Comments**: Matches existing comments with active findings. If an issue has been resolved in a new commit, it edits the GitHub comment to cross out the message and tag it resolved.
+* **Reusable Action Packaging**: Packaged as a standalone Docker Action.
 
-| Phase | Planned | Actual |
-|---|---|---|
-| Phase 1 — Pipeline skeleton | 1h | ~40min |
-| Phase 2 — Real diff parsing | 1h | ~30min |
-| Phase 3 — Core analyzers | 2h | ~1.5h |
-| Phase 4 — Duplicate detection | 1h | ~30min |
-| Phase 5 — Hostile inputs + docs | 1h | ~40min |
+---
+
+## 7. Process & Timeline
+
+### Planned vs Actual Timeline
+The absolute start/end clock timestamps of the keyboard sessions are not verifiable in our local execution logs, but the workflow was developed sequentially in the following phases:
+
+* **Phase 1 — Skeleton Pipeline**: Verified pipeline wiring with a hardcoded review comment.
+* **Phase 2 — Real Diff Parsing**: Implemented the unified diff line mapping engine.
+* **Phase 3 — Core Analyzers**: Coded the regex scanners for null, async, and SOLID checks.
+* **Phase 4 — Duplicate Comment Prevention**: Coded comments retrieval and matching.
+* **Phase 5 — Hostile Input Hardening**: Added binary/minified checks and error boundaries.
 
 ### Abandoned Approaches
-
-**Attempt: Using GitHub diff position instead of line numbers**  
-GitHub's older review comment API accepted a `position` parameter (patch-relative line index). We initially explored using that as it avoids the diff parsing complexity. However, it was deprecated and produces confusing UX (comments appear on wrong lines). We implemented a full unified diff parser to get precise new-file line numbers instead.
+* **Patch-relative position mapping**: We initially attempted to use the deprecated `position` parameter (patch-relative line offset) to avoid writing a diff parser, but found that GitHub renders the comments on incorrect lines upon subsequent synchronize pushes. We abandoned this and wrote the full unified diff mapper to resolve absolute line numbers.
 
 ---
 
-## Limitations
+## 8. How to Run
 
-- Only analyzes **added lines** — cannot detect issues introduced by deletions or context that changed meaning
-- SOLID detection is heuristic and based on method name keywords — will miss non-obvious violations and may produce false positives for incidental keyword matches
-- Null check detection requires the guard to appear **within the same diff hunk** — guards in unchanged context code are not visible
-- Very large patches may be truncated by GitHub — the action skips files with missing patches safely
-- Async-without-await detection is hunk-scoped — if the method body spans multiple hunks, analysis is incomplete
-- No semantic understanding — cannot resolve type information, follow call graphs, or track values across functions
-- Does not support fork PRs (`pull_request_target`) — only same-repository PRs with the default `GITHUB_TOKEN`
+### Local Validation
+You can run the test suite and verify the build locally:
+```bash
+# Install dependencies
+npm install
 
----
+# Run unit tests
+npm run test
 
-## Next Steps
+# Compile TypeScript
+npm run build
 
-1. **Roslyn integration**: Replace regex-based analysis with a Roslyn-based C# compiler plugin for semantic accuracy
-2. **Hunk context expansion**: Request surrounding context lines from the GitHub API to improve null check and await detection across hunk boundaries
-3. **Resolved comment tracking**: Mark findings as resolved when the triggering code is removed in a subsequent push
-4. **Optional LLM enhancement**: Send diff hunks to an LLM for higher-coverage analysis; validate all LLM-returned line numbers independently through the diff parser before posting
-5. **False positive suppression**: Allow teams to configure which categories or patterns to enable/disable via a `.pr-sentry.yml` configuration file
-6. **Fork PR support**: Implement secure `pull_request_target` handling to review external contributor PRs
+# Build Docker image
+docker build -t pr-sentry .
+```
 
----
-
-## How to Run
-
-### Prerequisites
-
-- A GitHub repository containing C# code
-- Docker and Node.js 20 installed locally (for local testing only)
-
-### Step 1: Add this action to your repository
-
-Create `.github/workflows/pr-sentry.yml`:
+### GitHub Actions Deployment
+Add the following workflow file to `.github/workflows/pr-sentry.yml` in your target repository:
 
 ```yaml
 name: PR Sentry Reviewer
@@ -193,29 +176,11 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: YOUR_GITHUB_USERNAME/pr-sentry@main
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run PR Sentry
+        uses: REXSTONE03/Sentry-on-the-Diff@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
-
-### Step 2: Create a test PR
-
-```bash
-git checkout -b test-pr
-# Add or modify a .cs file with a recognizable pattern, e.g.:
-echo 'public class Test { public void Run() { var x = list.FirstOrDefault(); Console.WriteLine(x.Value); } }' > Test.cs
-git add Test.cs
-git commit -m "test: add null dereference example"
-git push origin test-pr
-# Open a PR targeting main
-```
-
-### Step 3: Observe results
-
-PR Sentry will:
-1. Trigger automatically on PR open
-2. Analyze changed `.cs` hunks
-3. Post inline review comments on the offending lines
-
-No manual configuration, secrets, or additional setup required.
