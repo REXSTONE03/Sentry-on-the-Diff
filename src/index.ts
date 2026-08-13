@@ -3,7 +3,7 @@ import * as github from '@actions/github';
 import { fetchChangedFiles } from './github/fetchDiff';
 import { runReviewer } from './analyzers/reviewer';
 import { publishReview } from './github/publishReview';
-import { fetchExistingComments, isDuplicate } from './github/existingComments';
+import { fetchExistingComments, isDuplicate, resolveFixedComments } from './github/existingComments';
 import { Finding } from './models/finding';
 
 async function run(): Promise<void> {
@@ -32,13 +32,16 @@ async function run(): Promise<void> {
     const findings: Finding[] = runReviewer(changedFiles);
     console.log(`Reviewer generated ${findings.length} total findings.`);
 
+    // Fetch existing review comments
+    const existingComments = await fetchExistingComments(octokit, owner, repo, prNumber);
+
+    // Automatically resolve conversations that have been fixed
+    await resolveFixedComments(octokit, owner, repo, prNumber, findings, existingComments);
+
     if (findings.length === 0) {
       console.log('No findings — skipping review submission.');
       return;
     }
-
-    // Fetch existing review comments to prevent duplicates
-    const existingComments = await fetchExistingComments(octokit, owner, repo, prNumber);
 
     // Filter out findings that already have matching comments
     const newFindings = findings.filter(finding =>

@@ -1,6 +1,25 @@
 import * as github from '@actions/github';
 import { Finding } from '../models/finding';
 
+/**
+ * Generates a clean markdown table summary of findings.
+ */
+export function generateSummaryBody(findings: Finding[]): string {
+  let body = `### 🛡️ PR Sentry Analysis Summary\n\n`;
+  body += `I have scanned the Pull Request diff hunks and identified **${findings.length}** code quality issue(s):\n\n`;
+  
+  body += `| Category | Severity | File | Line | Description |\n`;
+  body += `| :--- | :--- | :--- | :--- | :--- |\n`;
+  
+  for (const finding of findings) {
+    const emoji = finding.severity === 'error' ? '🔴' : '⚠️';
+    body += `| **${finding.category}** | ${emoji} ${finding.severity} | \`${finding.file}\` | L${finding.line} | ${finding.message} |\n`;
+  }
+  
+  body += `\n*Please review the inline comments on the files for more details.*`;
+  return body;
+}
+
 export async function publishReview(
   octokit: ReturnType<typeof github.getOctokit>,
   owner: string,
@@ -28,6 +47,7 @@ export async function publishReview(
       repo,
       pull_number: pullNumber,
       event: 'COMMENT',
+      body: generateSummaryBody(findings),
       comments
     });
 

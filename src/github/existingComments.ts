@@ -1,6 +1,7 @@
 import * as github from '@actions/github';
 
 export interface ExistingComment {
+  id: number;
   path: string;
   line: number | null;
   body: string;
@@ -12,9 +13,23 @@ export function normalizeMessage(text: string): string {
 }
 
 /** Extract the category tag from a comment body, e.g. "[null-handling]" → "null-handling". */
-function extractCategory(body: string): string | null {
+export function extractCategory(body: string): string | null {
   const match = body.match(/\*\*\[([^\]]+)\]\*\*/);
   return match ? match[1].toLowerCase() : null;
+}
+
+/** Returns true if the comment was posted by PR Sentry. */
+export function isPrSentryComment(body: string): boolean {
+  return (
+    body.includes('**[null-handling]**') ||
+    body.includes('**[async]**') ||
+    body.includes('**[SOLID]**')
+  );
+}
+
+/** Returns true if the comment has already been struck out or marked resolved. */
+export function isAlreadyResolved(body: string): boolean {
+  return body.includes('~~') || body.includes('Resolved in a subsequent commit');
 }
 
 export async function fetchExistingComments(
@@ -39,6 +54,7 @@ export async function fetchExistingComments(
 
     for (const comment of data) {
       allComments.push({
+        id: comment.id,
         path: comment.path,
         line: comment.line ?? comment.original_line ?? null,
         body: comment.body
@@ -73,7 +89,6 @@ export function isDuplicate(
     const commentCategory = extractCategory(comment.body);
     if (commentCategory !== findingCategory.toLowerCase()) continue;
 
-    // Compare a meaningful substring of the message — the first 80 chars
     const commentNorm = normalizeMessage(comment.body);
     const findingSnippet = normalizedFinding.slice(0, 80);
     if (commentNorm.includes(findingSnippet)) {
@@ -82,4 +97,48 @@ export function isDuplicate(
   }
 
   return false;
+}
+
+/**
+ * Scans existing PR comments and resolves any conversations that are no longer present
+ * in the active findings (i.e. the developer fixed the issue).
+ */
+export async function resolveFixedComments(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  activeFindings: { file: string; line: number; category: string }[],
+  existingComments: ExistingComment[]
+): Promise<void> {
+  const prSentryComments = existingComments.filter(
+    comment => isPrSentryComment(comment.body) && !isAlreadyResolved(comment.body)
+  );
+
+  for (const comment of prSentryComments) {
+    const category = extractCategory(comment.body);
+    if (!category) continue;
+
+    // Check if there is still a finding matching this comment's location and category
+    const stillExists = activeFindings.some(
+      finding =>
+        finding.file === comment.path &&
+        finding.line === comment.line &&
+        finding.category.toLowerCase() === category
+    );
+
+    if (!stillExists) {
+      console.log(`Resolving fixed conversation on ${comment.path} line ${comment.line} (Comment ID: ${comment.id}).`);
+      try {
+        await octokit.rest.pulls.updateReviewComment({
+          owner,
+          repo,
+          comment_id: comment.id,
+          body: `~~${comment.body}~~\n\n🛡️ **PR Sentry:** Resolved in a subsequent commit.`
+        });
+      } catch (error: any) {
+        console.error(`Failed to update comment ${comment.id} to resolved:`, error.message);
+      }
+    }
+  }
 }

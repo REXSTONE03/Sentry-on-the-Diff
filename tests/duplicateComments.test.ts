@@ -1,13 +1,15 @@
-import { isDuplicate, normalizeMessage, ExistingComment } from '../src/github/existingComments';
+import { isDuplicate, normalizeMessage, ExistingComment, isPrSentryComment, isAlreadyResolved } from '../src/github/existingComments';
 
 describe('Duplicate Comment Detection', () => {
   const existingComments: ExistingComment[] = [
     {
+      id: 1,
       path: 'src/UserService.cs',
       line: 42,
       body: '**[null-handling]** `customer` is dereferenced without a null check after a nullable method call.'
     },
     {
+      id: 2,
       path: 'src/Worker.cs',
       line: 10,
       body: "**[async]** 'async void' should be avoided."
@@ -122,5 +124,29 @@ describe('normalizeMessage', () => {
   it('should strip leading/trailing whitespace', () => {
     const result = normalizeMessage('  some text  ');
     expect(result).toBe('some text');
+  });
+});
+
+describe('isPrSentryComment', () => {
+  it('should return true for PR Sentry tags', () => {
+    expect(isPrSentryComment('**[null-handling]** some warning')).toBe(true);
+    expect(isPrSentryComment('**[async]** error')).toBe(true);
+    expect(isPrSentryComment('**[SOLID]** warning')).toBe(true);
+  });
+
+  it('should return false for user or other tool comments', () => {
+    expect(isPrSentryComment('LGTM!')).toBe(false);
+    expect(isPrSentryComment('[lgtm] this looks good')).toBe(false);
+  });
+});
+
+describe('isAlreadyResolved', () => {
+  it('should return true if struck out or contains resolved keyword', () => {
+    expect(isAlreadyResolved('~~**[async]** error~~')).toBe(true);
+    expect(isAlreadyResolved('Resolved in a subsequent commit.')).toBe(true);
+  });
+
+  it('should return false if active', () => {
+    expect(isAlreadyResolved('**[async]** error')).toBe(false);
   });
 });
