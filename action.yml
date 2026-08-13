@@ -1,0 +1,11 @@
+name: 'PR Sentry'
+description: 'Automatically reviews C# Pull Requests for SOLID, null-safety, and async/await correctness'
+author: 'Antigravity'
+inputs:
+  github_token:
+    description: 'GitHub token for API access'
+    required: true
+    default: ${{ github.token }}
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
